@@ -71,6 +71,8 @@ const double SupportConfig::normal_cutoff_angle = 150.0 * M_PI / 180.0;
 // The shortest distance of any support structure from the model surface
 const double SupportConfig::safety_distance_mm = 0.5;
 
+const double SupportConfig::pillar_base_safety_distance_mm = 0.5;
+
 const double SupportConfig::max_solo_pillar_height_mm = 15.0;
 const double SupportConfig::max_dual_pillar_height_mm = 35.0;
 const double   SupportConfig::optimizer_rel_score_diff = 1e-6;
@@ -581,9 +583,14 @@ struct Pad {
         if(pcfg.embed_object) {
             
             auto modelbase_sticks = modelbase;
-            for(auto& poly : modelbase_sticks) 
-                sla::offset_with_breakstick_holes(poly, 0.5, 10, 0.3, 0.1);
-            
+            for(auto& poly : modelbase_sticks)
+                sla::offset_with_breakstick_holes(
+                    poly,
+                    SupportConfig::pillar_base_safety_distance_mm, // padding
+                    10,     // stride (mm)
+                    0.3,    // stick_width (mm)
+                    0.1);   // penetration (mm)
+
             create_base_pool(basep, tmesh, modelbase_sticks, cfg);
         } else {
             create_base_pool(basep, tmesh, {}, cfg);
@@ -1664,13 +1671,46 @@ public:
 
             Head& h = m_result.head(hid);
             h.transform();
-            Vec3d p = h.junction_point(); p(Z) = gndlvl;
-            auto& plr = m_result.add_pillar(hid, p, h.r_back_mm)
-                                .add_base(m_cfg.base_height_mm,
-                                          m_cfg.base_radius_mm);
+            Vec3d endp = h.junction_point();
+            endp(Z)    = gndlvl;
 
-            // Save the pillar endpoint and the pillar id in the spatial index
-            m_pillar_index.insert(plr.endpoint(), unsigned(plr.id));
+            // A new addition is the zero elevation feature which causes
+            // complications with the pillar base colliding with the model
+            // body. We have to measure the distance of the pillar position
+            // on the ground from the model surface and insert a small
+            // bridge between the head and the pillar to increase the
+            // distance and avoid collision.
+
+            if (m_cfg.object_elevation_mm < EPSILON) {
+                double dist = m_mesh.squared_distance(endp);
+                assert(dist >= 0);
+                dist      = std::sqrt(dist);
+                double sd = SupportConfig::pillar_base_safety_distance_mm;
+                double min_dist = sd + m_cfg.base_radius_mm;
+
+                if (dist < min_dist) {
+                    Vec3d jp   = h.junction_point();
+                    endp       = jp + (2 * sd) * h.dir;
+                    Vec3d pgnd = {endp(X), endp(Y), gndlvl};
+                    
+                    // If the 
+                    if (endp(Z) < gndlvl) {
+                        endp(Z) = gndlvl;
+                        m_result.add_junction(endp, h.r_back_mm);
+                    } else m_result.add_pillar(endp, pgnd, h.r_back_mm);
+
+                    // Add a degenerated and the bridge to the actual pillar
+                    m_result.add_pillar(hid, jp, h.r_back_mm);
+                    m_result.add_bridge(jp, endp, h.r_back_mm);
+                }
+            } else {
+                auto &plr = m_result.add_pillar(hid, endp, h.r_back_mm)
+                                    .add_base(m_cfg.base_height_mm,
+                                              m_cfg.base_radius_mm);
+
+                // Save the pillar endpoint in the spatial index
+                m_pillar_index.insert(plr.endpoint(), unsigned(plr.id));
+            }
         }
 
         // now we will go through the clusters ones again and connect the

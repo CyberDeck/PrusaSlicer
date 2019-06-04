@@ -150,6 +150,12 @@ public:
 #endif /* SLIC3R_SLA_NEEDS_WINDTREE */
 
     double squared_distance(const Vec3d& p, int& i, Vec3d& c) const;
+    inline double squared_distance(const Vec3d &p) const
+    {
+        int   i;
+        Vec3d c;
+        return squared_distance(p, i, c);
+    }
 };
 
 

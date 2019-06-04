@@ -91,6 +91,10 @@ struct SupportConfig {
 
     // The shortest distance of any support structure from the model surface
     static const double safety_distance_mm;
+    
+    // The shortest distance between a pillar base perimeter from the model
+    // body. This is only useful when elevation is set to zero.
+    static const double pillar_base_safety_distance_mm;
 
     static const double max_solo_pillar_height_mm;
     static const double max_dual_pillar_height_mm;
