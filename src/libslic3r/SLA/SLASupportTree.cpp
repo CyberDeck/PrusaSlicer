@@ -13,6 +13,7 @@
 #include <libslic3r/Model.hpp>
 
 #include <libnest2d/optimizers/nlopt/genetic.hpp>
+#include <libnest2d/optimizers/nlopt/subplex.hpp>
 #include <boost/log/trivial.hpp>
 #include <tbb/parallel_for.h>
 #include <libslic3r/I18N.hpp>
@@ -415,7 +416,7 @@ struct Pillar {
         assert(steps > 0);
 
         height = jp(Z) - endp(Z);
-        if(height > 0) { // Endpoint is below the starting point
+        if(height > EPSILON) { // Endpoint is below the starting point
 
             // We just create a bridge geometry with the pillar parameters and
             // move the data.
@@ -1388,6 +1389,83 @@ class SLASupportTree::Algorithm {
         return nearest_id >= 0;
     }
 
+    void create_ground_pillar(const Vec3d &jp,
+                              const Vec3d &sourcedir,
+                              double       radius,
+                              int          head_id = -1)
+    {
+        double gndlvl    = m_result.ground_level;
+        Vec3d  endp      = {jp(X), jp(Y), gndlvl};
+        double sd        = SupportConfig::pillar_base_safety_distance_mm;
+        int    pillar_id = -1;
+        double min_dist  = sd + m_cfg.base_radius_mm;
+        double dist      = 0;
+
+        if (m_cfg.object_elevation_mm < EPSILON
+            && (dist = std::sqrt(m_mesh.squared_distance(endp)) < min_dist)) {
+            // Get the distance from the mesh. This can be later optimized
+            // to get the distance in 2D plane because we are dealing with
+            // the ground level only.
+
+            double mv       = min_dist - dist + m_cfg.safety_distance_mm;
+            double azimuth  = std::atan2(sourcedir(Y), sourcedir(X));
+            double sinpolar = std::sin(PI - m_cfg.bridge_slope);
+            double cospolar = std::cos(PI - m_cfg.bridge_slope);
+            double cosazm   = std::cos(azimuth);
+            double sinazm   = std::sin(azimuth);
+
+            auto dir = Vec3d(cosazm * sinpolar, sinazm * sinpolar, cospolar)
+                           .normalized();
+
+            using namespace libnest2d::opt;
+            StopCriteria scr;
+            scr.stop_score = min_dist;
+            SubplexOptimizer solver(scr);
+
+            auto result = solver.optimize_max(
+                [this, dir, jp, gndlvl](double mv) {
+                    Vec3d endp = jp + std::sqrt(2) * mv * dir;
+                    endp(Z)    = gndlvl;
+                    return std::sqrt(m_mesh.squared_distance(endp));
+                },
+                initvals(mv), bound(0.0, 2 * min_dist));
+
+            mv         = std::get<0>(result.optimum);
+            endp       = jp + std::sqrt(2) * mv * dir;
+            Vec3d pgnd = {endp(X), endp(Y), gndlvl};
+
+            // If the new endpoint is below ground, do not make a pillar
+            if (endp(Z) < gndlvl)
+                endp(Z) = gndlvl;
+            else
+                pillar_id = m_result.add_pillar(endp, pgnd, radius)
+                                .add_base(m_cfg.base_height_mm,
+                                          m_cfg.base_radius_mm)
+                                .id;
+
+            m_result.add_junction(endp, radius);
+
+            // Add a degenerated pillar and the bridge
+            if (head_id >= 0)
+                m_result.add_pillar(unsigned(head_id), jp, radius);
+            
+            m_result.add_bridge(jp, endp, radius);
+            
+        } else {
+            Pillar &plr = head_id >= 0
+                              ? m_result.add_pillar(unsigned(head_id),
+                                                    endp,
+                                                    radius)
+                              : m_result.add_pillar(jp, endp, radius);
+
+            pillar_id
+                = plr.add_base(m_cfg.base_height_mm, m_cfg.base_radius_mm).id;
+        } 
+            
+        if(pillar_id >= 0) // Save the pillar endpoint in the spatial index
+            m_pillar_index.insert(endp, pillar_id);
+    }
+
 public:
 
     Algorithm(const SupportConfig& config,
@@ -1465,9 +1543,9 @@ public:
             // (Quaternion::FromTwoVectors) and apply the rotation to the
             // arrow head.
 
-            double z = n(2);
-            double r = 1.0;     // for normalized vector
-            double polar = std::acos(z / r);
+            double z       = n(2);
+            double r       = 1.0; // for normalized vector
+            double polar   = std::acos(z / r);
             double azimuth = std::atan2(n(1), n(0));
 
             // skip if the tilt is not sane
@@ -1617,16 +1695,22 @@ public:
         // from each other in the XY plane to not cross their pillar bases
         // These clusters of support points will join in one pillar,
         // possibly in their centroid support point.
+        
         auto pointfn = [this](unsigned i) {
             return m_result.head(i).junction_point();
         };
-        auto predicate = [this](const SpatElement& e1, const SpatElement& e2) {
+
+        auto predicate = [this](const SpatElement &e1,
+                                const SpatElement &e2) {
             double d2d = distance(to_2d(e1.first), to_2d(e2.first));
             double d3d = distance(e1.first, e2.first);
-            return d2d < 2 * m_cfg.base_radius_mm &&
-                   d3d < m_cfg.max_bridge_length_mm;
+            return d2d < 2 * m_cfg.base_radius_mm
+                   && d3d < m_cfg.max_bridge_length_mm;
         };
-        m_pillar_clusters = cluster(ground_head_indices, pointfn, predicate,
+
+        m_pillar_clusters = cluster(ground_head_indices,
+                                    pointfn,
+                                    predicate,
                                     m_cfg.max_bridges_on_pillar);
     }
 
@@ -1638,7 +1722,7 @@ public:
     void routing_to_ground()
     {
         const double pradius = m_cfg.head_back_radius_mm;
-        const double gndlvl = m_result.ground_level;
+        // const double gndlvl = m_result.ground_level;
 
         ClusterEl cl_centroids;
         cl_centroids.reserve(m_pillar_clusters.size());
@@ -1671,46 +1755,8 @@ public:
 
             Head& h = m_result.head(hid);
             h.transform();
-            Vec3d endp = h.junction_point();
-            endp(Z)    = gndlvl;
 
-            // A new addition is the zero elevation feature which causes
-            // complications with the pillar base colliding with the model
-            // body. We have to measure the distance of the pillar position
-            // on the ground from the model surface and insert a small
-            // bridge between the head and the pillar to increase the
-            // distance and avoid collision.
-
-            if (m_cfg.object_elevation_mm < EPSILON) {
-                double dist = m_mesh.squared_distance(endp);
-                assert(dist >= 0);
-                dist      = std::sqrt(dist);
-                double sd = SupportConfig::pillar_base_safety_distance_mm;
-                double min_dist = sd + m_cfg.base_radius_mm;
-
-                if (dist < min_dist) {
-                    Vec3d jp   = h.junction_point();
-                    endp       = jp + (2 * sd) * h.dir;
-                    Vec3d pgnd = {endp(X), endp(Y), gndlvl};
-                    
-                    // If the 
-                    if (endp(Z) < gndlvl) {
-                        endp(Z) = gndlvl;
-                        m_result.add_junction(endp, h.r_back_mm);
-                    } else m_result.add_pillar(endp, pgnd, h.r_back_mm);
-
-                    // Add a degenerated and the bridge to the actual pillar
-                    m_result.add_pillar(hid, jp, h.r_back_mm);
-                    m_result.add_bridge(jp, endp, h.r_back_mm);
-                }
-            } else {
-                auto &plr = m_result.add_pillar(hid, endp, h.r_back_mm)
-                                    .add_base(m_cfg.base_height_mm,
-                                              m_cfg.base_radius_mm);
-
-                // Save the pillar endpoint in the spatial index
-                m_pillar_index.insert(plr.endpoint(), unsigned(plr.id));
-            }
+            create_ground_pillar(h.junction_point(), h.dir, h.r_back_mm, h.id);
         }
 
         // now we will go through the clusters ones again and connect the
@@ -1737,15 +1783,20 @@ public:
                    !search_pillar_and_connect(sidehead))
                 {
                     Vec3d pstart = sidehead.junction_point();
-                    Vec3d pend = Vec3d{pstart(X), pstart(Y), gndlvl};
+                    //Vec3d pend = Vec3d{pstart(X), pstart(Y), gndlvl};
                     // Could not find a pillar, create one
-                    auto& pillar = m_result.add_pillar(unsigned(sidehead.id),
-                                                       pend, pradius)
-                                           .add_base(m_cfg.base_height_mm,
-                                                     m_cfg.base_radius_mm);
+                    create_ground_pillar(pstart,
+                                         sidehead.dir,
+                                         pradius,
+                                         sidehead.id);
+                    
+//                    auto& pillar = m_result.add_pillar(unsigned(sidehead.id),
+//                                                       pend, pradius)
+//                                           .add_base(m_cfg.base_height_mm,
+//                                                     m_cfg.base_radius_mm);
 
-                    // connects to ground, eligible for bridging
-                    m_pillar_index.insert(pend, unsigned(pillar.id));
+//                    // connects to ground, eligible for bridging
+//                    m_pillar_index.insert(pend, unsigned(pillar.id));
                 }
             }
         }
@@ -1774,12 +1825,13 @@ public:
             m_result.add_bridge(hjp, endp, head.r_back_mm);
             m_result.add_junction(endp, head.r_back_mm);
 
-            auto groundp = endp;
-            groundp(Z) = m_result.ground_level;
-            auto& newpillar = m_result.add_pillar(endp, groundp, head.r_back_mm)
-                                      .add_base(m_cfg.base_height_mm,
-                                                m_cfg.base_radius_mm);
-            m_pillar_index.insert(groundp, unsigned(newpillar.id));
+            this->create_ground_pillar(endp, dir, head.r_back_mm);
+//            auto groundp = endp;
+//            groundp(Z) = m_result.ground_level;
+//            auto& newpillar = m_result.add_pillar(endp, groundp, head.r_back_mm)
+//                                      .add_base(m_cfg.base_height_mm,
+//                                                m_cfg.base_radius_mm);
+//            m_pillar_index.insert(groundp, unsigned(newpillar.id));
         };
 
         std::vector<unsigned> modelpillars;
