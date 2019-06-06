@@ -1168,7 +1168,7 @@ class SLASupportTree::Algorithm {
             auto hr = m.query_ray_hit(p + sd*dir, dir);
 
             if(ins_check && hr.is_inside()) {
-                if(hr.distance() > r + sd) hits[i] = HitResult(0.0);
+                if(hr.distance() > 2 * r + sd) hits[i] = HitResult(0.0);
                 else {
                     // re-cast the ray from the outside of the object
                     auto hr2 =
@@ -1394,6 +1394,8 @@ class SLASupportTree::Algorithm {
                               double       radius,
                               int          head_id = -1)
     {
+        static const double SQR2 = std::sqrt(2.0);
+
         double gndlvl    = m_result.ground_level;
         Vec3d  endp      = {jp(X), jp(Y), gndlvl};
         double sd        = SupportConfig::pillar_base_safety_distance_mm;
@@ -1407,7 +1409,7 @@ class SLASupportTree::Algorithm {
             // to get the distance in 2D plane because we are dealing with
             // the ground level only.
 
-            double mv       = min_dist - dist + m_cfg.safety_distance_mm;
+            double mv       = min_dist - dist;
             double azimuth  = std::atan2(sourcedir(Y), sourcedir(X));
             double sinpolar = std::sin(PI - m_cfg.bridge_slope);
             double cospolar = std::cos(PI - m_cfg.bridge_slope);
@@ -1424,7 +1426,7 @@ class SLASupportTree::Algorithm {
 
             auto result = solver.optimize_max(
                 [this, dir, jp, gndlvl](double mv) {
-                    Vec3d endp = jp + std::sqrt(2) * mv * dir;
+                    Vec3d endp = jp + SQR2 * mv * dir;
                     endp(Z)    = gndlvl;
                     return std::sqrt(m_mesh.squared_distance(endp));
                 },
@@ -1436,20 +1438,19 @@ class SLASupportTree::Algorithm {
 
             // If the new endpoint is below ground, do not make a pillar
             if (endp(Z) < gndlvl)
-                endp(Z) = gndlvl;
+                endp = endp - SQR2 * (gndlvl - endp(Z)) * dir; // back off
             else
                 pillar_id = m_result.add_pillar(endp, pgnd, radius)
                                 .add_base(m_cfg.base_height_mm,
                                           m_cfg.base_radius_mm)
                                 .id;
-
+            
+            m_result.add_bridge(jp, endp, radius);
             m_result.add_junction(endp, radius);
 
             // Add a degenerated pillar and the bridge
             if (head_id >= 0)
                 m_result.add_pillar(unsigned(head_id), jp, radius);
-            
-            m_result.add_bridge(jp, endp, radius);
             
         } else {
             Pillar &plr = head_id >= 0
@@ -1789,14 +1790,6 @@ public:
                                          sidehead.dir,
                                          pradius,
                                          sidehead.id);
-                    
-//                    auto& pillar = m_result.add_pillar(unsigned(sidehead.id),
-//                                                       pend, pradius)
-//                                           .add_base(m_cfg.base_height_mm,
-//                                                     m_cfg.base_radius_mm);
-
-//                    // connects to ground, eligible for bridging
-//                    m_pillar_index.insert(pend, unsigned(pillar.id));
                 }
             }
         }
@@ -1826,12 +1819,6 @@ public:
             m_result.add_junction(endp, head.r_back_mm);
 
             this->create_ground_pillar(endp, dir, head.r_back_mm);
-//            auto groundp = endp;
-//            groundp(Z) = m_result.ground_level;
-//            auto& newpillar = m_result.add_pillar(endp, groundp, head.r_back_mm)
-//                                      .add_base(m_cfg.base_height_mm,
-//                                                m_cfg.base_radius_mm);
-//            m_pillar_index.insert(groundp, unsigned(newpillar.id));
         };
 
         std::vector<unsigned> modelpillars;
